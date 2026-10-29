@@ -5,9 +5,11 @@
  *   bsn_decode -9 packed_file packed_size unpacked_size output_file [expected_file]
  *   bsn_decode -2 packed_file packed_size unpacked_size output_file [expected_file]
  *   bsn_decode -3 packed_file packed_size unpacked_size output_file [expected_file]
- *     (for -9/-2/-3 the file may hold trailing bytes after the packed
- *     stream, e.g. archive terminator, mirroring what the original
- *     decoder sees)
+ *   bsn_decode -5 packed_file packed_size unpacked_size output_file [expected_file]
+ *   bsn_decode -6 packed_file packed_size unpacked_size output_file [expected_file]
+ *     (for -9/-2/-3/-5/-6 the file may hold trailing bytes after the
+ *     packed stream, e.g. archive terminator, mirroring what the
+ *     original decoder sees)
  *
  * Build with MSVC6:  cl bsn_decode.c bsn_lz.c bsn_m23.c bsn_ppm.c
  */
@@ -28,6 +30,8 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "-9") == 0) { method = 9; ai = 2; }
     if (argc >= 2 && strcmp(argv[1], "-2") == 0) { method = 2; ai = 2; }
     if (argc >= 2 && strcmp(argv[1], "-3") == 0) { method = 3; ai = 2; }
+    if (argc >= 2 && strcmp(argv[1], "-5") == 0) { method = 5; ai = 2; }
+    if (argc >= 2 && strcmp(argv[1], "-6") == 0) { method = 6; ai = 2; }
     if (method != 7) {
         if (argc - ai < 4) {
             fprintf(stderr, "Usage: %s -%d packed_file packed_size unpacked_size output_file [expected_file]\n", argv[0], method);
@@ -62,7 +66,7 @@ int main(int argc, char **argv) {
         unsigned long tsize = (psize_file > psize_log) ? (psize_file - psize_log) : 0;
         out = bsn_ppm_decode(packed, psize_log, packed + psize_log, tsize, outsize, &produced, 0);
     }
-    else if (method == 2 || method == 3) {
+    else if (method == 2 || method == 3 || method == 5 || method == 6) {
         /* trailing bytes likewise feed the bit reader on over-read */
         unsigned long tsize = (psize_file > psize_log) ? (psize_file - psize_log) : 0;
         out = bsn_m23_decode(packed, psize_log, packed + psize_log, tsize, outsize, &produced, method);

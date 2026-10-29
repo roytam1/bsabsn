@@ -6,8 +6,8 @@
  *      (LZ77 + dynamic canonical Huffman).
  * BSA: no global header; entries are u16 header-len (0 = terminator,
  *      a lone trailing 00 at EOF also ends old archives), 0xAE, method
- *      byte (0 = stored, 2/3 = BSA200 LZSS+Huffman, 7 = method 7),
- *      u32le packed size, u32le orig size, u32le timestamp, 3 x u16,
+ *      byte (0 = stored, 2/3/5/6 = BSA200 LZSS+Huffman variants,
+ *      7 = method 7), u32le packed size, u32le orig size, u32le timestamp, 3 x u16,
  *      namelen, name, NUL, then packed data. w1 is a byte-sum checksum
  *      (mod 2^16) of the original data, verified by the old tools.
  *      (The BSA writer stores 7 for every compressed flavor, so a PPM
@@ -260,6 +260,8 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
         if (flag == 0 || packed_size == orig_size) strcpy(method, "stored");
         else if (flag == 2) strcpy(method, "m2");
         else if (flag == 3) strcpy(method, "m3");
+        else if (flag == 5) strcpy(method, "m5");
+        else if (flag == 6) strcpy(method, "m6");
         else if (flag == 7) strcpy(method, "m7");
         else sprintf(method, "%02X?", flag);
         if (cmd == 2) {
@@ -341,7 +343,7 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
                 printf("  decoded %lu bytes%s\n", produced, used_ppm ? " (PPM)" : "");
             }
             free(obuf);
-        } else if (flag == 2 || flag == 3) {
+        } else if (flag == 2 || flag == 3 || flag == 5 || flag == 6) {
             unsigned char *tbuf = 0;
             unsigned long tsize = 0;
             long cur = ftell(f);
