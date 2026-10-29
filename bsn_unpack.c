@@ -1,5 +1,19 @@
-/* bsn_unpack.c - container parser/extractor for BSN archives (BSA 2.3) */
-/* Build with MSVC6: cl bsn_unpack.c */
+/* bsn_unpack.c - container parser/extractor for BSN and BSA archives (BSA 2.x)
+ *
+ * BSN: global magic FF 42 53 47, entry magic FF 42 53 41, big-endian
+ *      fields, per-entry CRC32. Compression from entry flags: 0x4000 ->
+ *      method 9 (PPM), 0x8000 -> method 10 (unsupported), else method 7
+ *      (LZ77 + dynamic canonical Huffman).
+ * BSA: no global header; entries are u16 header-len (0 = terminator),
+ *      0xAE, method byte (0 = stored, 7 = method 7), u32le packed size,
+ *      u32le orig size, u32le timestamp, 3 x u16, namelen, name, NUL,
+ *      then packed data. No per-entry CRC; success = produced == orig.
+ *      (The BSA writer stores 7 for every compressed method, so a PPM
+ *      stream in a BSA file is tried as method 9 when method 7 fails;
+ *      the originals cannot extract such files at all.)
+ *
+ * Build with MSVC6: cl bsn_unpack.c
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +56,48 @@ static unsigned int rd_be32(const unsigned char *p) {
            ((unsigned int)p[2] << 8) | p[3];
 }
 
+/* little-endian readers straight from the archive file (BSA headers) */
+static int rd_le16(FILE *f, unsigned int *v) {
+    int a = fgetc(f), b = fgetc(f);
+    if (a == EOF || b == EOF) return -1;
+    *v = (unsigned int)a | ((unsigned int)b << 8);
+    return 0;
+}
+static int rd_le32(FILE *f, unsigned long *v) {
+    int a = fgetc(f), b = fgetc(f), c = fgetc(f), d = fgetc(f);
+    if (a == EOF || b == EOF || c == EOF || d == EOF) return -1;
+    *v = (unsigned long)a | ((unsigned long)b << 8) |
+         ((unsigned long)c << 16) | ((unsigned long)d << 24);
+    return 0;
+}
+
+/* Capture up to 64K of the file tail at the current position (for the PPM
+ * range decoder, which over-reads past the packed end exactly like the
+ * original does). File position is preserved. */
+static int read_file_tail(FILE *f, unsigned char **tbuf, unsigned long *tsize) {
+    long cur = ftell(f);
+    long endpos;
+    unsigned long n;
+    unsigned char *b;
+    size_t r;
+    *tbuf = 0;
+    *tsize = 0;
+    if (cur < 0) return -1;
+    fseek(f, 0, SEEK_END);
+    endpos = ftell(f);
+    fseek(f, cur, SEEK_SET);
+    if (endpos <= cur) return 0;
+    n = (unsigned long)(endpos - cur);
+    if (n > 65536) n = 65536;
+    b = (unsigned char *)malloc(n ? n : 1);
+    if (!b) return -1;
+    r = fread(b, 1, n, f);
+    fseek(f, cur, SEEK_SET);
+    *tbuf = b;
+    *tsize = (unsigned long)r;
+    return 0;
+}
+
 static void sanitize(char *s) {
     char *p;
     for (p = s; *p; p++) {
@@ -64,22 +120,146 @@ static void make_parent_dirs(const char *path) {
     }
 }
 
-int main(int argc, char **argv) {
-    FILE *f;
-    const char *outbase;
+/* Decode BSA method 7 (LZ) with a method 9 (PPM) fallback: the BSA
+ * writer stores 7 for every compressed flavor, so a PPM stream arrives
+ * marked 7. LZ-first matches the original dispatch; PPM is attempted
+ * only when LZ fails or the size does not match. Returns 1 with *used_ppm
+ * set on a PPM success. */
+static int decode_bsa_data(FILE *f, const unsigned char *pbuf,
+                           unsigned long packed_size, unsigned long orig_size,
+                           unsigned char **obuf, unsigned long *produced,
+                           int *used_ppm) {
+    unsigned char *tbuf = 0;
+    unsigned long tsize = 0;
+    long cur = ftell(f);
+    *obuf = 0;
+    *produced = 0;
+    *used_ppm = 0;
+    *obuf = bsn_lz_decode(pbuf, packed_size, orig_size, produced);
+    if (*obuf && *produced == orig_size) return 1;
+    if (*obuf) { free(*obuf); *obuf = 0; }
+    if (cur < 0) return 0;
+    if (read_file_tail(f, &tbuf, &tsize) != 0) return 0;
+    printf("  method 7 failed, trying method 9 (PPM)...\n");
+    *obuf = bsn_ppm_decode(pbuf, packed_size, tbuf, tsize, orig_size, produced, 0);
+    if (tbuf) free(tbuf);
+    fseek(f, cur, SEEK_SET);
+    if (*obuf && *produced == orig_size) { *used_ppm = 1; return 1; }
+    if (*obuf) { free(*obuf); *obuf = 0; }
+    return 0;
+}
+
+static int unpack_bsa(FILE *f, const char *outbase) {
+    for (;;) {
+        int b0, b1, ae, flag, nl, c, i, used_ppm;
+        unsigned long packed_size, orig_size, ts;
+        unsigned int w1, w2, w3;
+        long hstart, hlen_got;
+        char filename[512];
+        char outpath[1024];
+        FILE *out;
+        unsigned char *pbuf;
+        unsigned char *obuf;
+        unsigned long produced;
+        size_t r;
+
+        hstart = ftell(f);
+        b0 = fgetc(f);
+        if (b0 == EOF) break;           /* normal end */
+        b1 = fgetc(f);
+        if (b1 == EOF) { fprintf(stderr, "truncated BSA entry\n"); fclose(f); return 1; }
+        if (b0 == 0 && b1 == 0) break;  /* archive terminator */
+        ae = fgetc(f);
+        if (ae != 0xAE) {
+            fprintf(stderr, "bad BSA entry magic at offset %ld\n", hstart);
+            fclose(f); return 1;
+        }
+        flag = fgetc(f);
+        if (flag == EOF) { fprintf(stderr, "truncated BSA entry\n"); fclose(f); return 1; }
+        if (rd_le32(f, &packed_size) != 0 || rd_le32(f, &orig_size) != 0 ||
+            rd_le32(f, &ts) != 0) {
+            fprintf(stderr, "truncated BSA sizes\n"); fclose(f); return 1;
+        }
+        if (rd_le16(f, &w1) != 0 || rd_le16(f, &w2) != 0 || rd_le16(f, &w3) != 0) {
+            fprintf(stderr, "truncated BSA header\n"); fclose(f); return 1;
+        }
+        nl = fgetc(f);
+        if (nl == EOF) { fprintf(stderr, "truncated BSA name\n"); fclose(f); return 1; }
+        for (i = 0; i < nl; i++) {
+            c = fgetc(f);
+            if (c == EOF) { fprintf(stderr, "truncated BSA name\n"); fclose(f); return 1; }
+            filename[i] = (char)c;
+        }
+        filename[nl] = 0;
+        c = fgetc(f);                   /* NUL terminator */
+        if (c == EOF) { fprintf(stderr, "truncated BSA entry\n"); fclose(f); return 1; }
+        sanitize(filename);
+
+        hlen_got = ftell(f) - hstart - 2;
+        if (hlen_got != b0)
+            fprintf(stderr, "warning: BSA header length mismatch for %s (got %ld want %d)\n",
+                    filename, hlen_got, b0);
+
+        printf("Extracting: %s  orig=%lu packed=%lu ts=%08lX attr=%04X flags=%02X\n",
+               filename, orig_size, packed_size, ts, w1, flag);
+
+        sprintf(outpath, "%s\\%s", outbase, filename);
+        make_parent_dirs(outpath);
+
+        if (packed_size == 0 && orig_size == 0) {
+            out = fopen(outpath, "wb");
+            if (!out) { perror("fopen out"); fclose(f); return 1; }
+            fclose(out);
+            continue;
+        }
+
+        pbuf = (unsigned char *)malloc(packed_size ? packed_size : 1);
+        if (!pbuf) { fprintf(stderr, "oom\n"); fclose(f); return 1; }
+        r = fread(pbuf, 1, packed_size, f);
+        if (r != packed_size) {
+            fprintf(stderr, "short data read for %s\n", filename);
+            free(pbuf); fclose(f); return 1;
+        }
+
+        if (flag == 0 || packed_size == orig_size) {
+            /* stored (uncompressed): copy through */
+            out = fopen(outpath, "wb");
+            if (!out) { perror("fopen out"); free(pbuf); fclose(f); return 1; }
+            if (packed_size) fwrite(pbuf, 1, packed_size, out);
+            fclose(out);
+            printf("  stored %lu bytes\n", packed_size);
+        } else if (flag == 7) {
+            obuf = 0;
+            produced = 0;
+            used_ppm = 0;
+            if (!decode_bsa_data(f, pbuf, packed_size, orig_size, &obuf, &produced, &used_ppm)) {
+                fprintf(stderr, "decode failed for %s\n", filename);
+                free(pbuf); fclose(f); return 1;
+            }
+            out = fopen(outpath, "wb");
+            if (!out) { perror("fopen out"); free(obuf); free(pbuf); fclose(f); return 1; }
+            if (produced) fwrite(obuf, 1, produced, out);
+            fclose(out);
+            free(obuf);
+            printf("  decoded %lu bytes%s\n", produced, used_ppm ? " (PPM)" : "");
+        } else {
+            fprintf(stderr, "unsupported BSA method %02X for %s\n", flag, filename);
+            free(pbuf); fclose(f); return 1;
+        }
+        free(pbuf);
+        (void)w2;
+        (void)w3;
+    }
+
+    fclose(f);
+    printf("Done.\n");
+    return 0;
+}
+
+static int unpack_bsn(FILE *f, const char *outbase) {
     unsigned char ghdr[6];
     unsigned int gflags;
     char gcomment[4096];
-
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s archive.bsn [outdir]\n", argv[0]);
-        return 1;
-    }
-    outbase = (argc >= 3) ? argv[2] : "bsn_out";
-    _mkdir(outbase);
-
-    f = fopen(argv[1], "rb");
-    if (!f) { perror("fopen"); return 1; }
 
     /* Global header */
     if (fread(ghdr, 1, 6, f) != 6) { fprintf(stderr, "short global header\n"); return 1; }
@@ -285,4 +465,32 @@ int main(int argc, char **argv) {
     fclose(f);
     printf("Done.\n");
     return 0;
+}
+
+int main(int argc, char **argv) {
+    FILE *f;
+    const char *outbase;
+    unsigned char probe[4];
+
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s archive[.bsn|.bsa] [outdir]\n", argv[0]);
+        return 1;
+    }
+    outbase = (argc >= 3) ? argv[2] : "bsn_out";
+    _mkdir(outbase);
+
+    f = fopen(argv[1], "rb");
+    if (!f) { perror("fopen"); return 1; }
+
+    /* Container detection: BSN starts with FF 42 53 47; a BSA entry
+     * starts with header-len, 00, AE. */
+    if (fread(probe, 1, 4, f) != 4) { fprintf(stderr, "short file\n"); fclose(f); return 1; }
+    fseek(f, 0, SEEK_SET);
+    if (probe[0] == 0xFF && probe[1] == 'B' && probe[2] == 'S' && probe[3] == 'G')
+        return unpack_bsn(f, outbase);
+    if (probe[2] == 0xAE)
+        return unpack_bsa(f, outbase);
+    fprintf(stderr, "unknown archive format\n");
+    fclose(f);
+    return 1;
 }
