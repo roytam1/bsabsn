@@ -12,6 +12,12 @@
  *      stream in a BSA file is tried as method 9 when method 7 fails;
  *      the originals cannot extract such files at all.)
  *
+ * Commands: bsn_unpack archive[.bsn|.bsa] [outdir]  (extract, default)
+ *           bsn_unpack t archive[.bsn|.bsa]          (test integrity:
+ *              decode every entry and verify size/CRC, no files written)
+ *           bsn_unpack l archive[.bsn|.bsa]          (list contents:
+ *              names, sizes, dates and methods, no decoding)
+ *
  * Build with MSVC6: cl bsn_unpack.c
  */
 #include <stdio.h>
@@ -46,6 +52,33 @@ static unsigned int crc32_buf(const unsigned char *buf, size_t len) {
     for (i = 0; i < len; i++)
         crc = crc_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
     return crc ^ 0xFFFFFFFFU;
+}
+
+/* Incremental CRC32: crc starts at 0xFFFFFFFFU, xor the result at the end. */
+static unsigned int crc32_update(unsigned int crc, const unsigned char *buf, size_t len) {
+    size_t i;
+    if (!crc_table_ready) make_crc_table();
+    for (i = 0; i < len; i++)
+        crc = crc_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+
+/* DOS date/time (date = high word, time = low word) to readable text. */
+static const char * const mon_names[12] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+
+static void fmt_dos_dt(unsigned long ts, char *out) {
+    unsigned int date = (unsigned int)(ts >> 16);
+    unsigned int time = (unsigned int)(ts & 0xFFFF);
+    int day = date & 31, mon = (date >> 5) & 15, yr = (date >> 9) + 1980;
+    int hh = time >> 11, mm = (time >> 5) & 63;
+    if (day < 1 || day > 31 || mon < 1 || mon > 12 || hh > 23 || mm > 59)
+        sprintf(out, "??-???-???? ??:??");
+    else
+        sprintf(out, "%02d-%s-%04d %02d:%02d",
+                day, mon_names[mon - 1], yr, hh, mm);
 }
 
 static unsigned int rd_be16(const unsigned char *p) {
@@ -149,7 +182,12 @@ static int decode_bsa_data(FILE *f, const unsigned char *pbuf,
     return 0;
 }
 
-static int unpack_bsa(FILE *f, const char *outbase) {
+static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd) {
+    int nfiles = 0, nfailed = 0;
+    unsigned long tot_orig = 0, tot_packed = 0;
+    if (cmd == 2)
+        printf("Listing of archive %s\n    SIZE PACKED DATE        TIME  METHOD  NAME\n-------- -------- ----------------- ------- --------------------\n",
+               archive);
     for (;;) {
         int b0, b1, ae, flag, nl, c, i, used_ppm;
         unsigned long packed_size, orig_size, ts;
@@ -157,6 +195,8 @@ static int unpack_bsa(FILE *f, const char *outbase) {
         long hstart, hlen_got;
         char filename[512];
         char outpath[1024];
+        char dtbuf[24];
+        char method[8];
         FILE *out;
         unsigned char *pbuf;
         unsigned char *obuf;
@@ -200,16 +240,38 @@ static int unpack_bsa(FILE *f, const char *outbase) {
             fprintf(stderr, "warning: BSA header length mismatch for %s (got %ld want %d)\n",
                     filename, hlen_got, b0);
 
-        printf("Extracting: %s  orig=%lu packed=%lu ts=%08lX attr=%04X flags=%02X\n",
-               filename, orig_size, packed_size, ts, w1, flag);
-
-        sprintf(outpath, "%s\\%s", outbase, filename);
-        make_parent_dirs(outpath);
+        nfiles++;
+        fmt_dos_dt(ts, dtbuf);
+        if (flag == 0 || packed_size == orig_size) strcpy(method, "stored");
+        else if (flag == 7) strcpy(method, "m7");
+        else sprintf(method, "%02X?", flag);
+        if (cmd == 2) {
+            /* list only: print the row and skip the packed data */
+            printf("%8lu %8lu %s %-7s %s\n",
+                   orig_size, packed_size, dtbuf, method, filename);
+            tot_orig += orig_size; tot_packed += packed_size;
+            if (fseek(f, (long)packed_size, SEEK_CUR) != 0) {
+                fprintf(stderr, "short data in %s\n", filename);
+                fclose(f); return 1;
+            }
+            continue;
+        }
+        if (cmd == 1)
+            printf("Testing    %s ... ", filename);
+        else {
+            printf("Extracting: %s  orig=%lu packed=%lu ts=%08lX attr=%04X flags=%02X\n",
+                   filename, orig_size, packed_size, ts, w1, flag);
+            sprintf(outpath, "%s\\%s", outbase, filename);
+            make_parent_dirs(outpath);
+        }
 
         if (packed_size == 0 && orig_size == 0) {
-            out = fopen(outpath, "wb");
-            if (!out) { perror("fopen out"); fclose(f); return 1; }
-            fclose(out);
+            if (cmd == 1) printf("OK (empty)\n");
+            else {
+                out = fopen(outpath, "wb");
+                if (!out) { perror("fopen out"); fclose(f); return 1; }
+                fclose(out);
+            }
             continue;
         }
 
@@ -223,25 +285,32 @@ static int unpack_bsa(FILE *f, const char *outbase) {
 
         if (flag == 0 || packed_size == orig_size) {
             /* stored (uncompressed): copy through */
-            out = fopen(outpath, "wb");
-            if (!out) { perror("fopen out"); free(pbuf); fclose(f); return 1; }
-            if (packed_size) fwrite(pbuf, 1, packed_size, out);
-            fclose(out);
-            printf("  stored %lu bytes\n", packed_size);
+            if (cmd == 1) printf("OK\n");
+            else {
+                out = fopen(outpath, "wb");
+                if (!out) { perror("fopen out"); free(pbuf); fclose(f); return 1; }
+                if (packed_size) fwrite(pbuf, 1, packed_size, out);
+                fclose(out);
+                printf("  stored %lu bytes\n", packed_size);
+            }
         } else if (flag == 7) {
             obuf = 0;
             produced = 0;
             used_ppm = 0;
             if (!decode_bsa_data(f, pbuf, packed_size, orig_size, &obuf, &produced, &used_ppm)) {
+                if (cmd == 1) { printf("FAILED (decode error)\n"); nfailed++; free(pbuf); continue; }
                 fprintf(stderr, "decode failed for %s\n", filename);
                 free(pbuf); fclose(f); return 1;
             }
-            out = fopen(outpath, "wb");
-            if (!out) { perror("fopen out"); free(obuf); free(pbuf); fclose(f); return 1; }
-            if (produced) fwrite(obuf, 1, produced, out);
-            fclose(out);
+            if (cmd == 1) printf("OK%s\n", used_ppm ? " (PPM)" : "");
+            else {
+                out = fopen(outpath, "wb");
+                if (!out) { perror("fopen out"); free(obuf); free(pbuf); fclose(f); return 1; }
+                if (produced) fwrite(obuf, 1, produced, out);
+                fclose(out);
+                printf("  decoded %lu bytes%s\n", produced, used_ppm ? " (PPM)" : "");
+            }
             free(obuf);
-            printf("  decoded %lu bytes%s\n", produced, used_ppm ? " (PPM)" : "");
         } else {
             fprintf(stderr, "unsupported BSA method %02X for %s\n", flag, filename);
             free(pbuf); fclose(f); return 1;
@@ -251,15 +320,28 @@ static int unpack_bsa(FILE *f, const char *outbase) {
         (void)w3;
     }
 
+    if (cmd == 2) {
+        fclose(f);
+        printf("-------- -------- ----------------- ------- --------------------\n");
+        printf("%8lu %8lu                     total %d file(s)\n", tot_orig, tot_packed, nfiles);
+        return 0;
+    }
+    if (cmd == 1) {
+        fclose(f);
+        printf("Tested %d file(s), %d failed.\n", nfiles, nfailed);
+        return nfailed ? 1 : 0;
+    }
     fclose(f);
     printf("Done.\n");
     return 0;
 }
 
-static int unpack_bsn(FILE *f, const char *outbase) {
+static int unpack_bsn(FILE *f, const char *archive, const char *outbase, int cmd) {
     unsigned char ghdr[6];
     unsigned int gflags;
     char gcomment[4096];
+    int nfiles = 0, nfailed = 0;
+    unsigned long tot_orig = 0, tot_packed = 0;
 
     /* Global header */
     if (fread(ghdr, 1, 6, f) != 6) { fprintf(stderr, "short global header\n"); return 1; }
@@ -267,6 +349,8 @@ static int unpack_bsn(FILE *f, const char *outbase) {
         fprintf(stderr, "bad global magic\n"); return 1;
     }
     gflags = rd_be16(ghdr + 4);
+    if (cmd == 2)
+        printf("Listing of archive %s\n", archive);
     printf("Global flags: 0x%04X\n", gflags);
     if (gflags & 0x0100) {
         /* NUL-terminated comment */
@@ -280,6 +364,8 @@ static int unpack_bsn(FILE *f, const char *outbase) {
     }
 
     /* Entries */
+    if (cmd == 2)
+        printf("    SIZE PACKED DATE        TIME  METHOD  NAME\n-------- -------- ----------------- ------- --------------------\n");
     for (;;) {
         unsigned char magic[4];
         unsigned int L;
@@ -293,6 +379,8 @@ static int unpack_bsn(FILE *f, const char *outbase) {
         const unsigned char *end;
         char filename[512];
         char outpath[1024];
+        char dtbuf[24];
+        char method[8];
         FILE *out;
         size_t data_to_read;
 
@@ -366,35 +454,80 @@ static int unpack_bsn(FILE *f, const char *outbase) {
             p += comment_len;
         }
 
-        printf("Extracting: %s  orig=%u packed=%u ts=%08X crc=%08X flags=%04X\n",
-               filename, orig_size, packed_size, ts, filecrc, eflags);
-
-        /* read packed data into memory */
-        sprintf(outpath, "%s\\%s", outbase, filename);
-        make_parent_dirs(outpath);
+        nfiles++;
+        fmt_dos_dt(ts, dtbuf);
+        if (packed_size == orig_size) strcpy(method, "stored");
+        else if (eflags & 0x8000) strcpy(method, "m10?");
+        else if (eflags & 0x4000) strcpy(method, "m9");
+        else strcpy(method, "m7");
+        if (cmd == 2) {
+            /* list only: print the row and skip the packed data */
+            printf("%8u %8u %s %-7s %s\n",
+                   orig_size, packed_size, dtbuf, method, filename);
+            tot_orig += orig_size; tot_packed += packed_size;
+            if (fseek(f, (long)packed_size, SEEK_CUR) != 0) {
+                fprintf(stderr, "short data in %s\n", filename);
+                free(blk); fclose(f); return 1;
+            }
+            free(blk);
+            continue;
+        }
+        if (cmd == 1)
+            printf("Testing    %s ... ", filename);
+        else {
+            printf("Extracting: %s  orig=%u packed=%u ts=%08X crc=%08X flags=%04X\n",
+                   filename, orig_size, packed_size, ts, filecrc, eflags);
+            /* read packed data into memory */
+            sprintf(outpath, "%s\\%s", outbase, filename);
+            make_parent_dirs(outpath);
+        }
 
         if (packed_size == 0 && orig_size == 0) {
             /* empty stored entry */
-            out = fopen(outpath, "wb");
-            if (!out) { perror("fopen out"); free(blk); return 1; }
-            fclose(out);
-        } else if (packed_size == orig_size) {
-            /* stored (uncompressed): copy through */
-            out = fopen(outpath, "wb");
-            if (!out) { perror("fopen out"); free(blk); return 1; }
-            data_to_read = packed_size;
-            {
-                char buf[65536];
-                size_t remaining = data_to_read;
-                while (remaining > 0) {
-                    size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-                    size_t r = fread(buf, 1, chunk, f);
-                    if (r != chunk) { fprintf(stderr, "short data read\n"); fclose(out); free(blk); return 1; }
-                    fwrite(buf, 1, r, out);
-                    remaining -= r;
-                }
+            if (cmd == 1) printf("OK (empty)\n");
+            else {
+                out = fopen(outpath, "wb");
+                if (!out) { perror("fopen out"); free(blk); return 1; }
+                fclose(out);
             }
-            fclose(out);
+        } else if (packed_size == orig_size) {
+            if (cmd == 1) {
+                /* test only: stream through and verify the data CRC */
+                unsigned int scrc = 0xFFFFFFFFU;
+                size_t trem = packed_size;
+                char buf[65536];
+                int shortrd = 0;
+                while (trem > 0) {
+                    size_t chunk = trem > sizeof(buf) ? sizeof(buf) : trem;
+                    size_t r2 = fread(buf, 1, chunk, f);
+                    if (r2 != chunk) { shortrd = 1; break; }
+                    scrc = crc32_update(scrc, (unsigned char *)buf, r2);
+                    trem -= r2;
+                }
+                if (shortrd) { fprintf(stderr, "short data read for %s\n", filename); free(blk); fclose(f); return 1; }
+                scrc ^= 0xFFFFFFFFU;
+                if (scrc != filecrc) {
+                    printf("FAILED (crc %08X want %08X)\n", scrc, filecrc);
+                    nfailed++;
+                } else printf("OK\n");
+            } else {
+                /* stored (uncompressed): copy through */
+                out = fopen(outpath, "wb");
+                if (!out) { perror("fopen out"); free(blk); return 1; }
+                data_to_read = packed_size;
+                {
+                    char buf[65536];
+                    size_t remaining = data_to_read;
+                    while (remaining > 0) {
+                        size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                        size_t r = fread(buf, 1, chunk, f);
+                        if (r != chunk) { fprintf(stderr, "short data read\n"); fclose(out); free(blk); return 1; }
+                        fwrite(buf, 1, r, out);
+                        remaining -= r;
+                    }
+                }
+                fclose(out);
+            }
         } else {
             /* compressed: method 7 (LZ+Huffman) or method 9 (PPM) */
             unsigned char *pbuf;
@@ -442,26 +575,45 @@ static int unpack_bsn(FILE *f, const char *outbase) {
                 obuf = bsn_lz_decode(pbuf, packed_size, orig_size, &produced);
             }
             free(pbuf);
-            if (!obuf) { fprintf(stderr, "decode failed for %s\n", filename); free(blk); return 1; }
+            if (!obuf) {
+                if (cmd == 1) { printf("FAILED (decode error)\n"); nfailed++; free(blk); continue; }
+                fprintf(stderr, "decode failed for %s\n", filename); free(blk); return 1;
+            }
             if (produced != orig_size) {
+                if (cmd == 1) { printf("FAILED (size %lu want %u)\n", produced, orig_size); nfailed++; free(obuf); free(blk); continue; }
                 fprintf(stderr, "size mismatch for %s (got %lu want %u)\n", filename, produced, orig_size);
                 free(obuf); free(blk); return 1;
             }
             dcrc = crc32_buf(obuf, produced);
             if (dcrc != filecrc) {
+                if (cmd == 1) { printf("FAILED (crc %08X want %08X)\n", dcrc, filecrc); nfailed++; free(obuf); free(blk); continue; }
                 fprintf(stderr, "data crc mismatch for %s (got %08X want %08X)\n", filename, dcrc, filecrc);
                 free(obuf); free(blk); return 1;
             }
-            out = fopen(outpath, "wb");
-            if (!out) { perror("fopen out"); free(obuf); free(blk); return 1; }
-            if (produced) fwrite(obuf, 1, produced, out);
-            fclose(out);
+            if (cmd == 1) printf("OK\n");
+            else {
+                out = fopen(outpath, "wb");
+                if (!out) { perror("fopen out"); free(obuf); free(blk); return 1; }
+                if (produced) fwrite(obuf, 1, produced, out);
+                fclose(out);
+                printf("  decoded %lu bytes, crc OK\n", produced);
+            }
             free(obuf);
-            printf("  decoded %lu bytes, crc OK\n", produced);
         }
         free(blk);
     }
 
+    if (cmd == 2) {
+        fclose(f);
+        printf("-------- -------- ----------------- ------- --------------------\n");
+        printf("%8lu %8lu                     total %d file(s)\n", tot_orig, tot_packed, nfiles);
+        return 0;
+    }
+    if (cmd == 1) {
+        fclose(f);
+        printf("Tested %d file(s), %d failed.\n", nfiles, nfailed);
+        return nfailed ? 1 : 0;
+    }
     fclose(f);
     printf("Done.\n");
     return 0;
@@ -470,16 +622,24 @@ static int unpack_bsn(FILE *f, const char *outbase) {
 int main(int argc, char **argv) {
     FILE *f;
     const char *outbase;
+    const char *archive;
     unsigned char probe[4];
+    int cmd = 0, ai = 1;
 
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s archive[.bsn|.bsa] [outdir]\n", argv[0]);
+    if (argc >= 2 && (strcmp(argv[1], "t") == 0 || strcmp(argv[1], "l") == 0)) {
+        cmd = (argv[1][0] == 't') ? 1 : 2;
+        ai = 2;
+    }
+    if (argc - ai < 1) {
+        fprintf(stderr, "Usage: %s [t|l] archive[.bsn|.bsa] [outdir]\n", argv[0]);
+        fprintf(stderr, "  (no command: extract; t: test integrity; l: list contents)\n");
         return 1;
     }
-    outbase = (argc >= 3) ? argv[2] : "bsn_out";
-    _mkdir(outbase);
+    archive = argv[ai];
+    outbase = (argc - ai >= 2) ? argv[ai + 1] : "bsn_out";
+    if (cmd == 0) _mkdir(outbase);
 
-    f = fopen(argv[1], "rb");
+    f = fopen(archive, "rb");
     if (!f) { perror("fopen"); return 1; }
 
     /* Container detection: BSN starts with FF 42 53 47; a BSA entry
@@ -487,9 +647,9 @@ int main(int argc, char **argv) {
     if (fread(probe, 1, 4, f) != 4) { fprintf(stderr, "short file\n"); fclose(f); return 1; }
     fseek(f, 0, SEEK_SET);
     if (probe[0] == 0xFF && probe[1] == 'B' && probe[2] == 'S' && probe[3] == 'G')
-        return unpack_bsn(f, outbase);
+        return unpack_bsn(f, archive, outbase, cmd);
     if (probe[2] == 0xAE)
-        return unpack_bsa(f, outbase);
+        return unpack_bsa(f, archive, outbase, cmd);
     fprintf(stderr, "unknown archive format\n");
     fclose(f);
     return 1;
