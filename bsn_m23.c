@@ -16,8 +16,10 @@
  * 0 -> 0, else (1<<(c-1))|extra(c-1) bits; method 2 adds 0x2000 for
  * symbols >= 0x180 (symbol -= 0x80); method 3 has three tiers
  * (0x140/0x180/0x1C0 -> +0x2000/0x4000/0x6000, symbol -= 0x40/0x80/0xC0)
- * and extends length when the symbol is 0x13D. Distance = base+1,
- * 64 KiB ring. Termination is output-driven (orig byte count).
+ * and extends length when the symbol is 0x13D. Method 5 uses the method 2
+ * wrapper plus the length extension when the symbol is 0x17D; method 6
+ * uses the method 3 wrapper. Distance = base+1, 64 KiB ring. Termination
+ * is output-driven (orig byte count).
  */
 #include <stdlib.h>
 #include <string.h>
@@ -225,9 +227,9 @@ static int decode_ext(M23 *m) {
     return mht_decode(&m->br, &m->lit);
 }
 
-/* sub_1F946 + method wrapper (seg018:031F for 2, seg018:038F for 3).
- * *sym is the length symbol, adjusted in place. Returns distance base,
- * or -1 on failure. */
+/* sub_1F946 + method wrapper (seg018:031F for 2, seg018:038F for 3/6,
+ * seg018:02F1 for 5). *sym is the length symbol, adjusted in place.
+ * Returns distance base, or -1 on failure. */
 static int decode_dist(M23 *m, int *sym) {
     int c, base, e, x;
     c = mht_decode(&m->br, &m->dist);
@@ -240,7 +242,15 @@ static int decode_dist(M23 *m, int *sym) {
     }
     if (m->method == 2) {
         if (*sym >= 0x180) { base += 0x2000; *sym -= 0x80; }
+    } else if (m->method == 5) {
+        if (*sym >= 0x180) { base += 0x2000; *sym -= 0x80; }
+        if (*sym == 0x17D) {
+            x = decode_ext(m);
+            if (x < 0) return -1;
+            *sym += x;
+        }
     } else {
+        /* methods 3 and 6 (wrappers seg018:038F and seg018:033A) */
         if (*sym >= 0x1C0) { base += 0x6000; *sym -= 0xC0; }
         else if (*sym >= 0x180) { base += 0x4000; *sym -= 0x80; }
         else if (*sym >= 0x140) { base += 0x2000; *sym -= 0x40; }
@@ -266,7 +276,7 @@ unsigned char *bsn_m23_decode(const unsigned char *packed, unsigned long psize,
     int s, sym, len, base;
 
     *produced = 0;
-    if (method != 2 && method != 3) return 0;
+    if (method != 2 && method != 3 && method != 5 && method != 6) return 0;
 
     out = (unsigned char *)malloc(outsize ? outsize : 1);
     if (!out) return 0;
