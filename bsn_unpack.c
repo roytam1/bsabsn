@@ -1,20 +1,22 @@
-/* bsn_unpack.c - container parser/extractor for BSN and BSA archives (BSA 2.x)
+/* bsn_unpack.c - container parser/extractor for BSN and BSA archives
  *
  * BSN: global magic FF 42 53 47, entry magic FF 42 53 41, big-endian
  *      fields, per-entry CRC32. Compression from entry flags: 0x4000 ->
  *      method 9 (PPM), 0x8000 -> method 10 (unsupported), else method 7
  *      (LZ77 + dynamic canonical Huffman).
- * BSA: no global header; entries are u16 header-len (0 = terminator),
- *      0xAE, method byte (0 = stored, 7 = method 7), u32le packed size,
- *      u32le orig size, u32le timestamp, 3 x u16, namelen, name, NUL,
- *      then packed data. No per-entry CRC; success = produced == orig.
- *      (The BSA writer stores 7 for every compressed method, so a PPM
+ * BSA: no global header; entries are u16 header-len (0 = terminator,
+ *      a lone trailing 00 at EOF also ends old archives), 0xAE, method
+ *      byte (0 = stored, 2/3 = BSA200 LZSS+Huffman, 7 = method 7),
+ *      u32le packed size, u32le orig size, u32le timestamp, 3 x u16,
+ *      namelen, name, NUL, then packed data. w1 is a byte-sum checksum
+ *      (mod 2^16) of the original data, verified by the old tools.
+ *      (The BSA writer stores 7 for every compressed flavor, so a PPM
  *      stream in a BSA file is tried as method 9 when method 7 fails;
  *      the originals cannot extract such files at all.)
  *
  * Commands: bsn_unpack archive[.bsn|.bsa] [outdir]  (extract, default)
  *           bsn_unpack t archive[.bsn|.bsa]          (test integrity:
- *              decode every entry and verify size/CRC, no files written)
+ *              decode every entry and verify size/checksum, no files written)
  *           bsn_unpack l archive[.bsn|.bsa]          (list contents:
  *              names, sizes, dates and methods, no decoding)
  *
@@ -26,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include "bsn_lz.h"
+#include "bsn_m23.h"
 #include "bsn_ppm.h"
 
 static unsigned int crc_table[256];
@@ -61,6 +64,15 @@ static unsigned int crc32_update(unsigned int crc, const unsigned char *buf, siz
     for (i = 0; i < len; i++)
         crc = crc_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
     return crc;
+}
+
+/* Byte-sum checksum (mod 2^16) used as the BSA per-entry checksum (w1). */
+static unsigned int bytesum_buf(const unsigned char *buf, size_t len) {
+    unsigned int s = 0;
+    size_t i;
+    for (i = 0; i < len; i++)
+        s += buf[i];
+    return s & 0xFFFFU;
 }
 
 /* DOS date/time (date = high word, time = low word) to readable text. */
@@ -207,7 +219,10 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
         b0 = fgetc(f);
         if (b0 == EOF) break;           /* normal end */
         b1 = fgetc(f);
-        if (b1 == EOF) { fprintf(stderr, "truncated BSA entry\n"); fclose(f); return 1; }
+        if (b1 == EOF) {
+            if (b0 == 0) break;   /* lone 00 terminator (old BSA16/BSA200 files) */
+            fprintf(stderr, "truncated BSA entry\n"); fclose(f); return 1;
+        }
         if (b0 == 0 && b1 == 0) break;  /* archive terminator */
         ae = fgetc(f);
         if (ae != 0xAE) {
@@ -243,6 +258,8 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
         nfiles++;
         fmt_dos_dt(ts, dtbuf);
         if (flag == 0 || packed_size == orig_size) strcpy(method, "stored");
+        else if (flag == 2) strcpy(method, "m2");
+        else if (flag == 3) strcpy(method, "m3");
         else if (flag == 7) strcpy(method, "m7");
         else sprintf(method, "%02X?", flag);
         if (cmd == 2) {
@@ -285,7 +302,13 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
 
         if (flag == 0 || packed_size == orig_size) {
             /* stored (uncompressed): copy through */
-            if (cmd == 1) printf("OK\n");
+            if (cmd == 1) {
+                if (bytesum_buf(pbuf, packed_size) != w1) {
+                    printf("FAILED (checksum)\n");
+                    nfailed++; free(pbuf); continue;
+                }
+                printf("OK\n");
+            }
             else {
                 out = fopen(outpath, "wb");
                 if (!out) { perror("fopen out"); free(pbuf); fclose(f); return 1; }
@@ -302,6 +325,13 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
                 fprintf(stderr, "decode failed for %s\n", filename);
                 free(pbuf); fclose(f); return 1;
             }
+            if (bytesum_buf(obuf, produced) != w1) {
+                /* test mode verifies the checksum; the 2.x reader does not */
+                if (cmd == 1) {
+                    printf("FAILED (checksum)\n");
+                    nfailed++; free(obuf); free(pbuf); continue;
+                }
+            }
             if (cmd == 1) printf("OK%s\n", used_ppm ? " (PPM)" : "");
             else {
                 out = fopen(outpath, "wb");
@@ -309,6 +339,40 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
                 if (produced) fwrite(obuf, 1, produced, out);
                 fclose(out);
                 printf("  decoded %lu bytes%s\n", produced, used_ppm ? " (PPM)" : "");
+            }
+            free(obuf);
+        } else if (flag == 2 || flag == 3) {
+            unsigned char *tbuf = 0;
+            unsigned long tsize = 0;
+            long cur = ftell(f);
+            obuf = 0;
+            produced = 0;
+            /* the bit reader may over-read into following file bytes */
+            if (cur >= 0) read_file_tail(f, &tbuf, &tsize);
+            printf("  method %d decompressing...\n", flag);
+            obuf = bsn_m23_decode(pbuf, packed_size, tbuf, tsize, orig_size, &produced, flag);
+            if (tbuf) free(tbuf);
+            if (cur >= 0) fseek(f, cur, SEEK_SET);
+            if (!obuf || produced != orig_size) {
+                if (cmd == 1) { printf("FAILED (decode error)\n"); nfailed++; free(pbuf); continue; }
+                fprintf(stderr, "decode failed for %s\n", filename);
+                free(pbuf); fclose(f); return 1;
+            }
+            if (bytesum_buf(obuf, produced) != w1) {
+                /* BSA16/BSA200 verify the byte-sum checksum after extract */
+                if (cmd == 1) printf("FAILED (checksum)\n");
+                else fprintf(stderr, "checksum error for %s\n", filename);
+                free(obuf); free(pbuf);
+                if (cmd == 1) { nfailed++; continue; }
+                fclose(f); return 1;
+            }
+            if (cmd == 1) printf("OK\n");
+            else {
+                out = fopen(outpath, "wb");
+                if (!out) { perror("fopen out"); free(obuf); free(pbuf); fclose(f); return 1; }
+                if (produced) fwrite(obuf, 1, produced, out);
+                fclose(out);
+                printf("  decoded %lu bytes\n", produced);
             }
             free(obuf);
         } else {
