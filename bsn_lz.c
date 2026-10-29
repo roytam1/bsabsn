@@ -55,7 +55,9 @@ static unsigned long br_peek(BITREADER *br, int n) {
     return v;
 }
 
-/* Canonical Huffman, MSB-first. */
+/* Canonical Huffman, MSB-first. A "const" table decodes a fixed symbol
+ * consuming zero bits (original fills the fast table with a constant when
+ * the code count is 0: sub_413260 / sub_413750 cnt==0 path). */
 typedef struct {
     int maxlen;
     int count[MAXBITS+1];
@@ -64,6 +66,8 @@ typedef struct {
     int nsyms;
     int sym_len[MAXBITS*520];
     int sym_val[MAXBITS*520];
+    int is_const;
+    int const_sym;
 } HTREE;
 
 static int htree_build(HTREE *t, const int *lens, int n) {
@@ -94,11 +98,20 @@ static int htree_build(HTREE *t, const int *lens, int n) {
         }
     }
     t->nsyms = k;
+    t->is_const = 0;
+    t->const_sym = 0;
     return k ? 0 : -1;
+}
+
+static void htree_build_const(HTREE *t, int sym) {
+    memset(t, 0, sizeof(*t));
+    t->is_const = 1;
+    t->const_sym = sym;
 }
 
 static int htree_decode(BITREADER *br, const HTREE *t) {
     int l, code = 0, d;
+    if (t->is_const) return t->const_sym;
     for (l = 1; l <= t->maxlen; l++) {
         code = (code << 1) | (int)br_getbit(br);
         d = code - t->first[l];
@@ -124,13 +137,17 @@ static int read_codevalue(BITREADER *br) {
 }
 
 /* sub_413260: read code lengths for the meta/distance alphabet.
- * n = alphabet size, cntbits = bits for the count, gap = zero-run cadence. */
-static int read_codelens(BITREADER *br, int *lens, int n, int cntbits, int gap) {
+ * n = alphabet size, cntbits = bits for the count, gap = zero-run cadence.
+ * cnt==0 means a constant table: the special value is stored in *const_sym
+ * (>=0) and no lengths are read. *const_sym is set to -1 otherwise. */
+static int read_codelens(BITREADER *br, int *lens, int n, int cntbits, int gap,
+                         int *const_sym) {
     int cnt = (int)br_read(br, cntbits);
     int i = 0;
     memset(lens, 0, sizeof(int) * n);
+    *const_sym = -1;
     if (cnt == 0) {
-        (void)br_read(br, cntbits);   /* special value */
+        *const_sym = (int)br_read(br, cntbits);   /* special value */
         return 0;
     }
     while (i < cnt) {
@@ -145,13 +162,15 @@ static int read_codelens(BITREADER *br, int *lens, int n, int cntbits, int gap) 
     return 0;
 }
 
-/* sub_413750: read the 510 literal/length code lengths via the meta tree. */
-static int read_litlens(BITREADER *br, const HTREE *meta, int *lens) {
+/* sub_413750: read the 510 literal/length code lengths via the meta tree.
+ * cnt==0 means a constant table (special value in *const_sym). */
+static int read_litlens(BITREADER *br, const HTREE *meta, int *lens, int *const_sym) {
     int cnt = (int)br_read(br, 9);
     int i = 0;
     memset(lens, 0, sizeof(int) * 510);
+    *const_sym = -1;
     if (cnt == 0) {
-        (void)br_read(br, 9);   /* special value */
+        *const_sym = (int)br_read(br, 9);   /* special value */
         return 0;
     }
     while (i < cnt) {
@@ -184,6 +203,7 @@ unsigned char *bsn_lz_decode(const unsigned char *packed, unsigned long psize,
     int metalens[19], litlens[510], dlens[17];
     HTREE meta, lit, dist;
     int n, i, s;
+    int meta_const, lit_const, dist_const;
 
     br.data = packed; br.size = psize; br.bitpos = 0;
     out = (unsigned char *)malloc(outsize ? outsize : 1);
@@ -193,12 +213,15 @@ unsigned char *bsn_lz_decode(const unsigned char *packed, unsigned long psize,
 
     for (;;) {
         /* ---- block header ---- */
-        read_codelens(&br, metalens, 19, 5, 3);
-        if (htree_build(&meta, metalens, 19) != 0) { free(out); return 0; }
-        if (read_litlens(&br, &meta, litlens) != 0) { free(out); return 0; }
-        if (htree_build(&lit, litlens, 510) != 0) { free(out); return 0; }
-        read_codelens(&br, dlens, 17, 5, 0);
-        if (htree_build(&dist, dlens, 17) != 0) { free(out); return 0; }
+        read_codelens(&br, metalens, 19, 5, 3, &meta_const);
+        if (meta_const >= 0) htree_build_const(&meta, meta_const);
+        else if (htree_build(&meta, metalens, 19) != 0) { free(out); return 0; }
+        if (read_litlens(&br, &meta, litlens, &lit_const) != 0) { free(out); return 0; }
+        if (lit_const >= 0) htree_build_const(&lit, lit_const);
+        else if (htree_build(&lit, litlens, 510) != 0) { free(out); return 0; }
+        read_codelens(&br, dlens, 17, 5, 0, &dist_const);
+        if (dist_const >= 0) htree_build_const(&dist, dist_const);
+        else if (htree_build(&dist, dlens, 17) != 0) { free(out); return 0; }
 
         /* ---- tokens ---- */
         for (i = 0; i < n; i++) {
