@@ -263,16 +263,21 @@ static int decode_dist(M23 *m, int *sym) {
     return base;
 }
 
+/* 64 KiB sliding window, persistent across entries within one archive
+ * (like the original's static window buffer, which is never cleared).
+ * wpos keeps running so later entries can match earlier ones. */
+static unsigned char m23_ring[65536];
+static unsigned long m23_wpos = 0;
+
 unsigned char *bsn_m23_decode(const unsigned char *packed, unsigned long psize,
                               const unsigned char *trail, unsigned long tsize,
                               unsigned long outsize, unsigned long *produced,
                               int method) {
     M23 m;
-    unsigned char *inbuf, *ring, *out;
+    unsigned char *inbuf, *out;
     unsigned long opos = 0;
     unsigned long rhi;      /* remaining-high + 1 (word_27E3C) */
     unsigned int rlo;       /* remaining-low (bp) */
-    unsigned int wpos = 0;  /* ring position (di) */
     int s, sym, len, base;
 
     *produced = 0;
@@ -280,14 +285,11 @@ unsigned char *bsn_m23_decode(const unsigned char *packed, unsigned long psize,
 
     out = (unsigned char *)malloc(outsize ? outsize : 1);
     if (!out) return 0;
-    ring = (unsigned char *)malloc(65536);
-    if (!ring) { free(out); return 0; }
-    memset(ring, 0, 65536);
 
     /* input = packed stream + trailing archive bytes, like the original
      * sees them (its bit reader runs past the packed end into file data) */
     inbuf = (unsigned char *)malloc((psize + tsize) ? (psize + tsize) : 1);
-    if (!inbuf) { free(out); free(ring); return 0; }
+    if (!inbuf) { free(out); return 0; }
     if (psize) memcpy(inbuf, packed, psize);
     if (tsize) memcpy(inbuf + psize, trail, tsize);
 
@@ -299,7 +301,7 @@ unsigned char *bsn_m23_decode(const unsigned char *packed, unsigned long psize,
     m.method = method;
     m.blkcount = 1;
 
-    if (outsize == 0) { free(inbuf); free(ring); return out; }
+    if (outsize == 0) { free(inbuf); return out; }
 
     rhi = (outsize >> 16) + 1;
     rlo = (unsigned int)(outsize & 0xFFFF);
@@ -320,9 +322,9 @@ unsigned char *bsn_m23_decode(const unsigned char *packed, unsigned long psize,
         s = mht_decode(&m.br, &m.lit);
         if (s < 0) goto done;
         if (s < 0x100) {
-            ring[wpos] = (unsigned char)s;
+            m23_ring[m23_wpos] = (unsigned char)s;
             out[opos++] = (unsigned char)s;
-            wpos = (wpos + 1) & 0xFFFF;
+            m23_wpos = (m23_wpos + 1) & 0xFFFF;
             /* exactly one countdown step per literal; on a ring wrap
              * this substitutes for the step skipped by the wrap branch */
             if (rlo == 0) { rlo = 0xFFFF; if (--rhi == 0) goto done; }
@@ -336,24 +338,24 @@ unsigned char *bsn_m23_decode(const unsigned char *packed, unsigned long psize,
             len = sym - 0xFD;   /* distance is base+1 */
             if (len < 3 || opos + (unsigned long)len > outsize) goto done;
             /* source starts (base+1) bytes back: si = di-1-base */
-            src = (unsigned int)((wpos - 1 - base) & 0xFFFF);
+            src = (unsigned int)((m23_wpos - 1 - (unsigned long)base) & 0xFFFF);
             /* fast path iff neither source nor dest range wraps 64K */
-            mx = src > wpos ? src : wpos;
+            mx = src > (unsigned int)m23_wpos ? src : (unsigned int)m23_wpos;
             if (((unsigned long)mx + (unsigned long)len) & 0x10000UL) {
                 for (k = 0; k < len; k++) {
-                    unsigned char b = ring[src];
-                    ring[wpos] = b;
+                    unsigned char b = m23_ring[src];
+                    m23_ring[m23_wpos] = b;
                     out[opos++] = b;
                     src = (src + 1) & 0xFFFF;
-                    wpos = (wpos + 1) & 0xFFFF;
+                    m23_wpos = (m23_wpos + 1) & 0xFFFF;
                 }
             } else {
                 for (k = 0; k < len; k++) {
-                    unsigned char b = ring[(src + k) & 0xFFFF];
-                    ring[(wpos + k) & 0xFFFF] = b;
+                    unsigned char b = m23_ring[(src + k) & 0xFFFF];
+                    m23_ring[(m23_wpos + (unsigned long)k) & 0xFFFF] = b;
                     out[opos++] = b;
                 }
-                wpos = (wpos + (unsigned int)len) & 0xFFFF;
+                m23_wpos = (m23_wpos + (unsigned long)len) & 0xFFFF;
             }
             /* 32-bit remaining -= len; done iff exactly zero */
             {
@@ -369,6 +371,5 @@ unsigned char *bsn_m23_decode(const unsigned char *packed, unsigned long psize,
 done:
     *produced = opos;
     free(inbuf);
-    free(ring);
     return out;
 }
