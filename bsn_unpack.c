@@ -143,11 +143,40 @@ static int read_file_tail(FILE *f, unsigned char **tbuf, unsigned long *tsize) {
     return 0;
 }
 
-static void sanitize(char *s) {
-    char *p;
-    for (p = s; *p; p++) {
-        if (*p == '/' || *p == '\\') *p = '_';
+/* Validate an archive member name and normalize separators to '/'.
+ * Returns 0 if safe, -1 if the name is absolute, has a drive letter,
+ * is empty, or contains a ".." component (path traversal). Single "."
+ * and empty components are dropped. */
+static int clean_path(char *dst, size_t dstsz, const char *src) {
+    size_t di = 0;
+    const char *p = src;
+    if (p[0] == '/' || p[0] == '\\') return -1;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') return -1;
+    while (*p) {
+        const char *end = p;
+        size_t len;
+        while (*end && *end != '/' && *end != '\\') end++;
+        len = (size_t)(end - p);
+        if (len == 0) {
+            /* empty component (double slash): skip */
+        } else if (len == 1 && p[0] == '.') {
+            /* single dot: skip */
+        } else if (len == 2 && p[0] == '.' && p[1] == '.') {
+            return -1;
+        } else {
+            if (di > 0) {
+                if (di + 1 >= dstsz) return -1;
+                dst[di++] = '/';
+            }
+            if (di + len >= dstsz) return -1;
+            memcpy(dst + di, p, len);
+            di += len;
+        }
+        p = *end ? end + 1 : end;
     }
+    if (di == 0 || di >= dstsz) return -1;
+    dst[di] = 0;
+    return 0;
 }
 
 static void make_parent_dirs(const char *path) {
@@ -206,6 +235,7 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
         unsigned int w1, w2, w3;
         long hstart, hlen_got;
         char filename[512];
+        char safename[512];
         char outpath[1024];
         char dtbuf[24];
         char method[8];
@@ -248,12 +278,17 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
         filename[nl] = 0;
         c = fgetc(f);                   /* NUL terminator */
         if (c == EOF) { fprintf(stderr, "truncated BSA entry\n"); fclose(f); return 1; }
-        sanitize(filename);
+
+        if (clean_path(safename, sizeof(safename), filename) != 0) {
+            fprintf(stderr, "warning: skipping unsafe path '%s'\n", filename);
+            if (fseek(f, (long)packed_size, SEEK_CUR) != 0) { fclose(f); return 1; }
+            continue;
+        }
 
         hlen_got = ftell(f) - hstart - 2;
         if (hlen_got != b0)
             fprintf(stderr, "warning: BSA header length mismatch for %s (got %ld want %d)\n",
-                    filename, hlen_got, b0);
+                    safename, hlen_got, b0);
 
         nfiles++;
         fmt_dos_dt(ts, dtbuf);
@@ -267,20 +302,25 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
         if (cmd == 2) {
             /* list only: print the row and skip the packed data */
             printf("%8lu %8lu %s %-7s %s\n",
-                   orig_size, packed_size, dtbuf, method, filename);
+                   orig_size, packed_size, dtbuf, method, safename);
             tot_orig += orig_size; tot_packed += packed_size;
             if (fseek(f, (long)packed_size, SEEK_CUR) != 0) {
-                fprintf(stderr, "short data in %s\n", filename);
+                fprintf(stderr, "short data in %s\n", safename);
                 fclose(f); return 1;
             }
             continue;
         }
         if (cmd == 1)
-            printf("Testing    %s ... ", filename);
+            printf("Testing    %s ... ", safename);
         else {
             printf("Extracting: %s  orig=%lu packed=%lu ts=%08lX attr=%04X flags=%02X\n",
-                   filename, orig_size, packed_size, ts, w1, flag);
-            sprintf(outpath, "%s\\%s", outbase, filename);
+                   safename, orig_size, packed_size, ts, w1, flag);
+            if (strlen(outbase) + 1 + strlen(safename) >= sizeof(outpath)) {
+                fprintf(stderr, "path too long, skipping %s\n", safename);
+                if (fseek(f, (long)packed_size, SEEK_CUR) != 0) { fclose(f); return 1; }
+                continue;
+            }
+            sprintf(outpath, "%s\\%s", outbase, safename);
             make_parent_dirs(outpath);
         }
 
@@ -298,7 +338,7 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
         if (!pbuf) { fprintf(stderr, "oom\n"); fclose(f); return 1; }
         r = fread(pbuf, 1, packed_size, f);
         if (r != packed_size) {
-            fprintf(stderr, "short data read for %s\n", filename);
+            fprintf(stderr, "short data read for %s\n", safename);
             free(pbuf); fclose(f); return 1;
         }
 
@@ -324,7 +364,7 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
             used_ppm = 0;
             if (!decode_bsa_data(f, pbuf, packed_size, orig_size, &obuf, &produced, &used_ppm)) {
                 if (cmd == 1) { printf("FAILED (decode error)\n"); nfailed++; free(pbuf); continue; }
-                fprintf(stderr, "decode failed for %s\n", filename);
+                fprintf(stderr, "decode failed for %s\n", safename);
                 free(pbuf); fclose(f); return 1;
             }
             if (bytesum_buf(obuf, produced) != w1) {
@@ -357,13 +397,13 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
             if (cur >= 0) fseek(f, cur, SEEK_SET);
             if (!obuf || produced != orig_size) {
                 if (cmd == 1) { printf("FAILED (decode error)\n"); nfailed++; free(pbuf); continue; }
-                fprintf(stderr, "decode failed for %s\n", filename);
+                fprintf(stderr, "decode failed for %s\n", safename);
                 free(pbuf); fclose(f); return 1;
             }
             if (bytesum_buf(obuf, produced) != w1) {
                 /* BSA16/BSA200 verify the byte-sum checksum after extract */
                 if (cmd == 1) printf("FAILED (checksum)\n");
-                else fprintf(stderr, "checksum error for %s\n", filename);
+                else fprintf(stderr, "checksum error for %s\n", safename);
                 free(obuf); free(pbuf);
                 if (cmd == 1) { nfailed++; continue; }
                 fclose(f); return 1;
@@ -378,7 +418,7 @@ static int unpack_bsa(FILE *f, const char *archive, const char *outbase, int cmd
             }
             free(obuf);
         } else {
-            fprintf(stderr, "unsupported BSA method %02X for %s\n", flag, filename);
+            fprintf(stderr, "unsupported BSA method %02X for %s\n", flag, safename);
             free(pbuf); fclose(f); return 1;
         }
         free(pbuf);
@@ -444,6 +484,7 @@ static int unpack_bsn(FILE *f, const char *archive, const char *outbase, int cmd
         const unsigned char *p;
         const unsigned char *end;
         char filename[512];
+        char safename[512];
         char outpath[1024];
         char dtbuf[24];
         char method[8];
@@ -500,7 +541,6 @@ static int unpack_bsn(FILE *f, const char *archive, const char *outbase, int cmd
             filename[fi] = 0;
             if (p < end && *p == 0) p++; /* skip NUL */
         }
-        sanitize(filename);
 
         if (eflags & 0x0008) {
             if (p + 4 > end) { fprintf(stderr, "short extra\n"); free(blk); return 1; }
@@ -520,38 +560,62 @@ static int unpack_bsn(FILE *f, const char *archive, const char *outbase, int cmd
             p += comment_len;
         }
 
+        /* validate + normalize the member path (keep subdirectories,
+         * reject absolute paths and ".." escapes) */
+        if (clean_path(safename, sizeof(safename), filename) != 0) {
+            fprintf(stderr, "warning: skipping unsafe path '%s'\n", filename);
+            if (fseek(f, (long)packed_size, SEEK_CUR) != 0) { free(blk); fclose(f); return 1; }
+            free(blk);
+            continue;
+        }
+
         nfiles++;
         fmt_dos_dt(ts, dtbuf);
-        if (packed_size == orig_size) strcpy(method, "stored");
+        if (packed_size == 0 && orig_size == 0 && (eflags & 0x0A00) == 0x0A00) strcpy(method, "dir");
+        else if (packed_size == orig_size) strcpy(method, "stored");
         else if (eflags & 0x8000) strcpy(method, "m10?");
         else if (eflags & 0x4000) strcpy(method, "m9");
         else strcpy(method, "m7");
         if (cmd == 2) {
             /* list only: print the row and skip the packed data */
             printf("%8u %8u %s %-7s %s\n",
-                   orig_size, packed_size, dtbuf, method, filename);
+                   orig_size, packed_size, dtbuf, method, safename);
             tot_orig += orig_size; tot_packed += packed_size;
             if (fseek(f, (long)packed_size, SEEK_CUR) != 0) {
-                fprintf(stderr, "short data in %s\n", filename);
+                fprintf(stderr, "short data in %s\n", safename);
                 free(blk); fclose(f); return 1;
             }
             free(blk);
             continue;
         }
         if (cmd == 1)
-            printf("Testing    %s ... ", filename);
+            printf("Testing    %s ... ", safename);
         else {
             printf("Extracting: %s  orig=%u packed=%u ts=%08X crc=%08X flags=%04X\n",
-                   filename, orig_size, packed_size, ts, filecrc, eflags);
+                   safename, orig_size, packed_size, ts, filecrc, eflags);
+            if (strlen(outbase) + 1 + strlen(safename) >= sizeof(outpath)) {
+                fprintf(stderr, "path too long, skipping %s\n", safename);
+                if (fseek(f, (long)packed_size, SEEK_CUR) != 0) { free(blk); fclose(f); return 1; }
+                free(blk);
+                continue;
+            }
             /* read packed data into memory */
-            sprintf(outpath, "%s\\%s", outbase, filename);
+            sprintf(outpath, "%s\\%s", outbase, safename);
             make_parent_dirs(outpath);
         }
 
         if (packed_size == 0 && orig_size == 0) {
-            /* empty stored entry */
-            if (cmd == 1) printf("OK (empty)\n");
+            if ((eflags & 0x0A00) == 0x0A00) {
+                /* directory entry: create it */
+                if (cmd == 1) printf("OK (dir)\n");
+                else {
+                    make_parent_dirs(outpath);
+                    _mkdir(outpath);
+                    printf("  dir\n");
+                }
+            } else if (cmd == 1) printf("OK (empty)\n");
             else {
+                /* empty stored entry */
                 out = fopen(outpath, "wb");
                 if (!out) { perror("fopen out"); free(blk); return 1; }
                 fclose(out);
@@ -570,7 +634,7 @@ static int unpack_bsn(FILE *f, const char *archive, const char *outbase, int cmd
                     scrc = crc32_update(scrc, (unsigned char *)buf, r2);
                     trem -= r2;
                 }
-                if (shortrd) { fprintf(stderr, "short data read for %s\n", filename); free(blk); fclose(f); return 1; }
+                if (shortrd) { fprintf(stderr, "short data read for %s\n", safename); free(blk); fclose(f); return 1; }
                 scrc ^= 0xFFFFFFFFU;
                 if (scrc != filecrc) {
                     printf("FAILED (crc %08X want %08X)\n", scrc, filecrc);
@@ -606,7 +670,7 @@ static int unpack_bsn(FILE *f, const char *archive, const char *outbase, int cmd
             r = fread(pbuf, 1, packed_size, f);
             if (r != packed_size) { fprintf(stderr, "short data read\n"); free(pbuf); free(blk); return 1; }
             if (eflags & 0x8000) {
-                fprintf(stderr, "unsupported compression method (flags %04X) for %s\n", eflags, filename);
+                fprintf(stderr, "unsupported compression method (flags %04X) for %s\n", eflags, safename);
                 free(pbuf); free(blk); return 1;
             } else if (eflags & 0x4000) {
                 /* method 9 (PPM): range decoder over-reads into trailing
@@ -643,17 +707,17 @@ static int unpack_bsn(FILE *f, const char *archive, const char *outbase, int cmd
             free(pbuf);
             if (!obuf) {
                 if (cmd == 1) { printf("FAILED (decode error)\n"); nfailed++; free(blk); continue; }
-                fprintf(stderr, "decode failed for %s\n", filename); free(blk); return 1;
+                fprintf(stderr, "decode failed for %s\n", safename); free(blk); return 1;
             }
             if (produced != orig_size) {
                 if (cmd == 1) { printf("FAILED (size %lu want %u)\n", produced, orig_size); nfailed++; free(obuf); free(blk); continue; }
-                fprintf(stderr, "size mismatch for %s (got %lu want %u)\n", filename, produced, orig_size);
+                fprintf(stderr, "size mismatch for %s (got %lu want %u)\n", safename, produced, orig_size);
                 free(obuf); free(blk); return 1;
             }
             dcrc = crc32_buf(obuf, produced);
             if (dcrc != filecrc) {
                 if (cmd == 1) { printf("FAILED (crc %08X want %08X)\n", dcrc, filecrc); nfailed++; free(obuf); free(blk); continue; }
-                fprintf(stderr, "data crc mismatch for %s (got %08X want %08X)\n", filename, dcrc, filecrc);
+                fprintf(stderr, "data crc mismatch for %s (got %08X want %08X)\n", safename, dcrc, filecrc);
                 free(obuf); free(blk); return 1;
             }
             if (cmd == 1) printf("OK\n");

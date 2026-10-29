@@ -195,6 +195,13 @@ static int read_litlens(BITREADER *br, const HTREE *meta, int *lens, int *const_
     return 0;
 }
 
+/* 128 KiB sliding window, persistent across entries within one archive
+ * (like the original's static window buffer, which is never cleared).
+ * wpos keeps running so later entries can match earlier ones. */
+#define LZ_RING_MASK 0x1FFFFUL
+static unsigned char lz_ring[131072];
+static unsigned long lz_wpos = 0;
+
 unsigned char *bsn_lz_decode(const unsigned char *packed, unsigned long psize,
                              unsigned long outsize, unsigned long *produced) {
     BITREADER br;
@@ -229,6 +236,8 @@ unsigned char *bsn_lz_decode(const unsigned char *packed, unsigned long psize,
             s = htree_decode(&br, &lit);
             if (s < 0) { free(out); return 0; }
             if (s < 256) {
+                lz_ring[lz_wpos] = (unsigned char)s;
+                lz_wpos = (lz_wpos + 1) & LZ_RING_MASK;
                 out[opos++] = (unsigned char)s;
             } else {
                 int len = s - 253;
@@ -245,8 +254,9 @@ unsigned char *bsn_lz_decode(const unsigned char *packed, unsigned long psize,
                 for (j = 0; j < len; j++) {
                     unsigned char c;
                     if (opos >= outsize) goto done;
-                    if (distance > opos) c = 0;      /* zero-filled window */
-                    else c = out[opos - distance];
+                    c = lz_ring[(lz_wpos - distance) & LZ_RING_MASK];
+                    lz_ring[lz_wpos] = c;
+                    lz_wpos = (lz_wpos + 1) & LZ_RING_MASK;
                     out[opos++] = c;
                 }
             }
