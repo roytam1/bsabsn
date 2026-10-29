@@ -1,0 +1,36 @@
+Packing program BSA (R) 2.0 for DOS,WIN,OS/2,QNX,UNIX  (Rel 1.10)
+(C) Copyright PTS Ltd (tm) 1992-1994. All rights reserved.
+tel (095) 408-7072, Moscow
+Use: bsa [-]command [-modifier...]* archive [base-dir/] [file ...]
+
+Commands:
+ a :Append file(s) to archive         d :Delete file(s) from archive
+ f :Fresh file in archive             h :more help
+ l :Listing files in archive          o :lOcate files in archives
+ p :Printout files                    t :Test integrity
+ e :Extract                           x :eXtract with fullnames
+ u :Update                            v :Verbose listing
+ 6 :convert for modem format          8 :convert from modem format
+ s :convert to SelfExe (DOS only)     n :create New archive
+Modifier:
+ -v :Volume handling (bsn)            -f :only Fresh -u: only Update
+ -b :Block mode (bsn)                 -d :block mode for directories (bsn)
+ -e :Exclude patterns from operation  -m :Move (if success)
+ -r :Recursive                        -t :Test after operation
+ -+[0-4] :set compression level from high to fast (fast uncompression)
+ -++: set very high compression ( slow uncompression)
+ -l[ru|en|ge] - set diagnostic language (russian,english,Deutch)
+ -p :save full Path                   -y :assume Yes
+ -s :make output archive as SelfExtract (DOS only)
+ -/ :remove first '/' from names      -S :Silence
+ -z: Zero compression for archives    -q :Query
+ -iXXX :handle archiver XXX (bsn,bsa,arj,tar)
+ -wDIR :Work directory for temporary
+ -oDIR :Output directory for extract
+ -jt: Text mode (bsn)                 -jb: Binary mode (bsn)
+ -cl: comment Local files (bsn)       -cg: comment Global archive (bsn)
+ -cs: comment silence                 -c@FILE: responce file with comments (bsn)
+
+       OK @ for responce-files, for example bsa -a arc @file.rsp
+       Name matching as in POSIX, not DOS.
+You can place commonly used modifiers to file bsa.ini (in same dir as bsa.exe)
