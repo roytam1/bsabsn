@@ -43,10 +43,15 @@ offset  size  field
 
 Method dispatch from `eflags`: `0x8000` → method 10 (not
 implemented); `0x4000` → method 9 (PPM); otherwise method 7.
-`packed_size == orig_size` means stored (raw copy);
-`packed_size == orig_size == 0` with `eflags & 0x0A00` is a directory
-entry (creates the directory, e.g. `ptsdos/cp`); without it, an
-empty stored file. Filenames keep `/`-separated subfolders.
+`eflags & 0x0800` marks a stored (raw copy) entry — writers must
+set it, as `bsa32` reports a `packed_size == orig_size` entry
+without it as corrupt (this unpacker accepts either). Directory
+entries are `0x0A00`, i.e. stored (`0x0800`) plus directory
+(`0x0200`), with `packed_size == orig_size == 0` (creates the
+directory, e.g. `ptsdos/cp`); without the directory bit, a zero
+size is an empty stored file. Filenames keep `/`-separated
+subfolders. The original BSN writer never stores non-empty files —
+it compresses even when that expands them (e.g. 12 -> 23 bytes).
 
 Known global flags: `0x0001` (bsa32), `0x0080` (BSA2-230; only
 the `0x0100` bit is acted upon).
@@ -157,6 +162,34 @@ original feeds it the following archive bytes — the unpacker
 passes up to 64 KiB of file tail for this. Decoding ends at
 the EOF symbol or `orig_size` bytes; CRC32 is then verified.
 
+There are two incompatible PPM variants: the bsa32/BSA2-230/BSA200-
+Rel-0.982 one (e.g. `sample-p.bsn`), which this decoder, `bsa32`
+and Rel 0.982 handle, and BSA200 Rel 0.972's (`-++`, e.g.
+`samplep.bsn`, byte-identical to fresh Rel-0.972 output), whose
+model diverges from the newer one after a few symbols — Rel 0.982
+and `bsa32 t` both CRC-fail it and this decoder fails it
+identically (same garbage output), so only Rel 0.972 `t` extracts
+it. A fresh Rel-0.982 `-++` archive is byte-identical to
+`sample-p.bsn` except for the global-flags byte (`0x0000` vs
+`0x0080`), so global flags alone do not identify the Rel-0.972
+variant (both Rel builds write `0x0000`; both also reject
+`0x0080` archives at the container check). Method 7 has no such
+split (both Rel builds' method-7 archives pass `bsa32 t`). From
+`BSA200.lst` (Rel 0.972; dispatch case 9 → `sub_21CFD` → main loop
+`sub_21F44`), Rel 0.972's PPM differs from bsa32's in at least:
+max order 4 (not 5), hash multipliers 3/2/1 with the order-4 hash
+masked to 0x1FFF (8192-entry hash table, not 65536), context
+bytes stride 4 (not 5), version-selected sizes (version 1:
+NCTX 15360, NPOOL 32760), no per-decode frequency halving after a
+symbol (bsa32 halves the chain), no `total <= 0x1000` forced
+escape, scaled-mode switch at `total > 5` (not `> 6`), and
+unscaled/scaled switch at `escAcc >= 3` (not `>= 4`). A patched
+bsa32 decoder with just those parameters moved the divergence
+from byte 6 to byte 11, so further decode-symbol total/escape
+details still differ; a full port must translate Rel 0.972's
+`sub_21546`/`sub_225D5`/`sub_21218`/`sub_21821`/`sub_221D9`
+faithfully.
+
 ## 7. Checksums
 
 - BSN: CRC32 of the L-block (stored or complemented) plus CRC32 of the decoded data vs `filecrc`.
@@ -168,5 +201,6 @@ the EOF symbol or `orig_size` bytes; CRC32 is then verified.
 - No packer emits flags 01/05/06/09 (decode-only dispatch cases); BSA16 additionally emits 2/3 (auto-selected: orig ≥ `0x5000` → 3, else 2).
 - Old archives terminate with a single `00` at EOF instead of `00 00`.
 - BSA2-230's packed streams are byte-identical to bsa32 2.3 output; only its global-flags byte differs (`0x80` vs `0x01`).
-- BSA200's packer is broken under emulation (headers never written); BSA16's and BSA2-230's work. BSA's `-+0..4` only retune method-7 effort; `-++` selects PPM (still flagged 7).
+- BSA200 Rel 0.972's BSA packer is broken under emulation (headers never written; the archive starts with zero bytes); its BSN packer works (method 7 and, with `-++`, PPM — the latter is the `samplep.bsn` variant above). BSA16's and BSA2-230's work. BSA200's `-+0..4` only retune method-7 effort; `-++` selects PPM (still flagged 7 in BSA).
+- Compressed streams (methods 7 and 2/3) end with an extra `00` byte past the byte holding the last token bit; the original bit reader looks ahead past the final token and misdecodes it when a stream ends flush at the archive end, while the tolerant port in `bsn_lz.c` does not. The `bsn_pack` encoders finish with 32 zero bits for the same reason.
 - BSArc 2.00 (`.bs2`) is a different archiver family (own container, magic `SB`, methods {0,1}, CRC32) sharing only LHA-derived table code — out of scope here.

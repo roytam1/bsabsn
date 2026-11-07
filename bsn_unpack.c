@@ -701,6 +701,12 @@ static int unpack_bsn(FILE *f, const char *archive, const char *outbase, int cmd
                 if (tbuf) free(tbuf);
                 /* reposition after packed data for next entry */
                 fseek(f, cur, SEEK_SET);
+                if ((!obuf || produced != orig_size) && (gflags & 0x0080) == 0)
+                    fprintf(stderr,
+                        "note: PPM decode failed; this may be the BSA200 "
+                        "Rel 0.972 PPM variant (e.g. samplep.bsn), which "
+                        "is incompatible with Rel 0.982+/bsa32 PPM and "
+                        "can only be extracted by BSA200 Rel 0.972\n");
             } else {
                 obuf = bsn_lz_decode(pbuf, packed_size, orig_size, &produced);
             }
