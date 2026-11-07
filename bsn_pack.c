@@ -8,6 +8,10 @@
  *   bsn_pack -7 archive.bsa file...  compress with method 7 (default)
  *   bsn_pack -3 archive.bsa file...  compress with method 3 (BSA only)
  *   bsn_pack -2 archive.bsa file...  compress with method 2 (BSA only)
+ *   bsn_pack -6 archive.bsa file...  compress with method 6 (BSA only;
+ *                                    identical stream to method 3)
+ *   bsn_pack -5 archive.bsa file...  compress with method 5 (BSA only;
+ *                                    method 2 wrapper + length extension)
  *   bsn_pack -r archive.bsa dir...   add directories recursively
  *   bsn_pack -v ...                  list each file as it is packed
  *
@@ -587,10 +591,15 @@ static int write_bsa(FILE *f, ENTRIES *es, int method, int verbose,
         free(pbuf);
         *tot_orig += orig;
         *tot_packed += packed;
-        if (verbose)
+        if (verbose) {
+            const char *mname = "method 3";
+            if (method == 7) mname = "method 7";
+            else if (method == 2) mname = "method 2";
+            else if (method == 5) mname = "method 5";
+            else if (method == 6) mname = "method 6";
             printf("%s: %lu -> %lu (%s)\n", e->stored, orig, packed,
-                   stored ? "stored" : (method == 7 ? "method 7" :
-                   (method == 2 ? "method 2" : "method 3")));
+                   stored ? "stored" : mname);
+        }
     }
     {
         static const unsigned char term[2] = {0, 0};
@@ -603,12 +612,14 @@ static int write_bsa(FILE *f, ENTRIES *es, int method, int verbose,
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s [-0|-7|-2|-3] [-r] [-v] archive[.bsa|.bsn] file...\n"
+        "Usage: %s [-0|-7|-2|-3|-5|-6] [-r] [-v] archive[.bsa|.bsn] file...\n"
         "  -0  store files uncompressed\n"
         "  -7  method 7 compression (default; the only compressed "
         "BSN method)\n"
         "  -2  method 2 compression (BSA archives only)\n"
         "  -3  method 3 compression (BSA archives only)\n"
+        "  -5  method 5 compression (BSA only; method 2 + extension)\n"
+        "  -6  method 6 compression (BSA only; same stream as -3)\n"
         "  -r  add directories recursively\n"
         "  -v  list each file as it is packed\n", prog);
 }
@@ -634,11 +645,13 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[ai], "-7") == 0) method = 7;
         else if (strcmp(argv[ai], "-2") == 0) method = 2;
         else if (strcmp(argv[ai], "-3") == 0) method = 3;
+        else if (strcmp(argv[ai], "-5") == 0) method = 5;
+        else if (strcmp(argv[ai], "-6") == 0) method = 6;
         else if (strcmp(argv[ai], "-r") == 0) recursive = 1;
         else if (strcmp(argv[ai], "-v") == 0) verbose = 1;
         else if (strcmp(argv[ai], "-9") == 0) {
             fprintf(stderr, "error: method 9 (PPM) has no encoder; "
-                    "only stored, method 7 and (for BSA) methods 2/3 "
+                    "only stored, method 7 and (for BSA) methods 2/3/5/6 "
                     "can be written\n");
             return 1;
         }
@@ -658,8 +671,9 @@ int main(int argc, char **argv) {
                 archive);
         return 1;
     }
-    if (format == 2 && (method == 2 || method == 3)) {
-        fprintf(stderr, "error: methods 2/3 only exist in BSA archives; "
+    if (format == 2 && (method == 2 || method == 3 || method == 5 ||
+                        method == 6)) {
+        fprintf(stderr, "error: methods 2/3/5/6 only exist in BSA archives; "
                 "use -7 or -0 for BSN\n");
         return 1;
     }

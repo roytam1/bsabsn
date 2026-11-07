@@ -12,10 +12,11 @@
 unsigned char *bsn_lz_encode(const unsigned char *in, unsigned long insize,
                              unsigned long *psize);
 
-/* Encode in as one BSA method 2 or 3 (LZSS + dynamic canonical Huffman)
- * stream. Method 6 shares method 3's wrapper, so 6 is accepted too and
- * produces identical bytes to method 3. Returns a malloc'd buffer
- * holding *psize bytes, or NULL on failure. */
+/* Encode in as one BSA method 2, 3, 5 or 6 (LZSS + dynamic canonical
+ * Huffman) stream. Method 6 shares method 3's wrapper, so 6 is
+ * accepted too and produces identical bytes to method 3. Method 5
+ * shares method 2's wrapper plus the length-extension symbol.
+ * Returns a malloc'd buffer holding *psize bytes, or NULL on failure. */
 unsigned char *bsn_m23_encode(const unsigned char *in, unsigned long insize,
                               unsigned long *psize, int method);
 

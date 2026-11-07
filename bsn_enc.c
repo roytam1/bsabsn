@@ -26,16 +26,25 @@
  * original's, even though the format could describe more). Blocks
  * hold at most 16384 tokens, the original encoder's maximum.
  *
- * Methods 2/3 block: same framing, but the lit/len alphabet is 510
- * symbols with len = symbol-0xFD, the distance alphabet is 14 symbols
- * and there is no token-length extension (matches are simply capped
- * at 127 bytes for method 2 and 63 for method 3, which also avoids
- * symbol 509 and method 3's 0x13D extension symbol; BSA16/193/195
- * misdecode method 2 matches using symbol 509). Method 2 has two
- * distance tiers (dist 1..8192 plain, 8193..16384 with the length
- * symbol shifted by 128), method 3 has four tiers (8192-byte bands,
- * the length symbol shifted by 64 per band), matching the decoders'
- * wrapper adjustments. Method 6 shares method 3's wrapper.
+ * Methods 2/3/5/6 block: same framing, but the lit/len alphabet is
+ * 510 symbols with len = symbol-0xFD, the distance alphabet is 14
+ * symbols and (apart from method 5 below) there is no token-length
+ * extension (matches are simply capped at 127 bytes for method 2
+ * and 63 for method 3, which also avoids symbol 509 and method 3's
+ * 0x13D extension symbol; BSA16/193/195 misdecode method 2 matches
+ * using symbol 509). Method 2 has two distance tiers (dist
+ * 1..8192 plain, 8193..16384 with the length symbol shifted by
+ * 128), method 3 has four tiers (8192-byte bands, the length
+ * symbol shifted by 64 per band), matching the decoders' wrapper
+ * adjustments. Method 6 shares method 3's wrapper. Method 5 shares
+ * method 2's wrapper and additionally defines a length-extension
+ * symbol (adjusted symbol 0x17D followed by one more lit symbol
+ * x, len = 128 + x); like method 6's extension it is never emitted
+ * here (matches are capped at 127 bytes, so the adjusted symbol
+ * never reaches 0x17D and the stream is identical to method 2's),
+ * because the original method-5 decoders mishandle emitted
+ * extensions (BSA200 CRC-fails extended matches with distance > 1;
+ * BSA193/195 fail on symbol 509).
  *
  * The LZ tokenizer is greedy with hash chains over 3-byte sequences,
  * and the window is reset for every file (the decoders' persistent
@@ -493,12 +502,17 @@ unsigned char *bsn_m23_encode(const unsigned char *in, unsigned long insize,
     int prelens[19], litlens[510], distlens[14];
     unsigned int precodes[19], litcodes[510], distcodes[14];
     BW bw;
-    if (method != 2 && method != 3 && method != 6) return 0;
+    if (method != 2 && method != 3 && method != 5 && method != 6) return 0;
     if (method == 2) { max_len = 127UL; max_dist = 16384UL; }
+    else if (method == 5) { max_len = 127UL; max_dist = 16384UL; }
     else { max_len = 63UL; max_dist = 32768UL; }
     memset(&bw, 0, sizeof(bw));
     *psize = 0;
     if (tokenize(in, insize, max_len, max_dist, &toks, &ntok) != 0) return 0;
+    /* Method 5 is capped at 127 bytes above, so its length
+     * extension (adjusted symbol 0x17D) is never emitted and no
+     * expansion is needed; the same applies to method 6 (capped
+     * at 63, never reaching 0x13D). */
     fixed_lens(prelens, litlens, distlens, 14);
     make_codes(prelens, 19, precodes);
     make_codes(litlens, 510, litcodes);
@@ -517,7 +531,7 @@ unsigned char *bsn_m23_encode(const unsigned char *in, unsigned long insize,
             } else {
                 int tier, sym, c, extra = 0;
                 unsigned long off, base_code, val = 0;
-                if (method == 2) {
+                if (method == 2 || method == 5) {
                     if (t->dist <= 8192UL) { tier = 0; off = 0UL; }
                     else { tier = 1; off = 0x2000UL; }
                     sym = 253 + (int)t->len + tier * 128;

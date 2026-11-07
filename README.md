@@ -3,9 +3,9 @@
 C reimplementation (MSVC6, C89) of the PTS BSA/BSN archive handling
 from `bsa32.exe` 2.3, verified byte-for-byte against the original
 DOS/Windows tools. Parses both container formats and fully
-decompresses methods 0, 2, 3, 7 and 9 (plus decode paths for
-methods 5/6, pending real test vectors), and writes both container
-formats back with `bsn_pack` (methods 0, 2, 3 and 7).
+decompresses methods 0, 2, 3, 5, 6, 7 and 9, and writes both
+container formats back with `bsn_pack` (methods 0, 2, 3, 5, 6
+and 7).
 
 ## Quick start
 
@@ -37,7 +37,7 @@ bsn_decode -2|-3|-5|-6 packed psize outsize out [expected]
 bsn_pack archive[.bsn|.bsa] file...   create an archive (format from extension)
 bsn_pack -0 archive.bsa file...       store files uncompressed
 bsn_pack -7 archive.bsn file...       method 7 compression (default)
-bsn_pack -3 archive.bsa file...       method 3 compression (BSA only; -2 likewise)
+bsn_pack -3 archive.bsa file...       method 3 compression (BSA only; -2/-5/-6 likewise)
 bsn_pack -r archive.bsa dir...        add directories recursively
 bsn_pack -v archive.bsn file...       list each file as it is packed
 ```
@@ -99,8 +99,15 @@ at the archive end), and BSN stored entries need flag `0x0800`
 tiny file) because `bsa32`'s BSN stored reader only copes with the
 first stored entry in an archive; for BSA it falls back to stored
 whenever compression would not be smaller, like `BSA16`. Method 9
-(PPM) has no encoder and `-9` is rejected; methods 5/6 remain
-decode-only.
+(PPM) has no encoder and `-9` is rejected. Methods 5/6 are written
+in extension-free form (capped at 127/63 bytes, so their extension
+symbols never occur and the streams equal methods 2/3 byte-for-byte
+apart from the method byte): emitted extensions are mishandled by
+the original decoders (BSA200 CRC-fails extended matches with
+distance > 1; BSA193/195 fail on symbol 509), while the
+extension-free form is accepted by every original that knows the
+method at all (BSA200 both Rels, BSA193/195; BSA160 predates 5/6,
+bsa32/BSA2-230 accept only 0/7/9).
 
 ## Method support
 
@@ -109,8 +116,8 @@ decode-only.
 | 0 stored | yes | yes | verified |
 | 2 LZSS+Huffman 16K | — | yes | verified byte-exact (`m2.bsa`) |
 | 3 LZSS+Huffman 32K | — | yes | verified byte-exact (`m3.bsa`, `Root.mnx`) |
-| 5 LZSS+Huffman | — | yes | decode path wired but **unvalidated** — no packer emits flag 05, no vector exists |
-| 6 LZSS+Huffman | — | yes | same code path as 3 (wrappers instruction-identical), no flag-06 vector exists |
+| 5 LZSS+Huffman | — | yes | encoder emits flag 05 (extension-free form, identical stream to method 2); `t`+`x` verified in BSA200 (both Rels), BSA193/195; BSA160/bsa32/BSA2-230 reject it as unknown (predate/support only 0/7/9 or 0/2/3) |
+| 6 LZSS+Huffman | — | yes | encoder emits flag 06 (identical stream to method 3); `t`+`x` verified in BSA200 (both Rels), BSA193/195; BSA160/bsa32/BSA2-230 reject it |
 | 7 LZ77+Huffman | yes | yes | verified byte-exact, all levels |
 | 9 PPM | yes | as flag 07 | verified byte-exact for the bsa32/BSA2-230/BSA200-Rel-0.982 variant (`sample-p.bsn`, `230-pp.bsn`); BSA200 **Rel 0.972**'s PPM variant (`samplep.bsn`, byte-identical to fresh Rel-0.972 `a -++` output) uses a different model and is incompatible with Rel 0.982+ — Rel 0.982, `bsa32` and this decoder all fail it (identical garbage output), so it is listed but not decoded. BSA writers store PPM marked 7, so it is retried when method 7 fails (the originals cannot extract such files at all) |
 | 10 | yes | — | clean "unsupported" error (no vectors) |

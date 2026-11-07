@@ -198,7 +198,7 @@ faithfully.
 ## 8. Errata / quirks (all handled)
 
 - Every BSA writer hardcodes the method byte to 0 or 7 (`(flags & 0x800) ? 0 : 7`); PPM streams therefore arrive marked 7. The unpacker tries method 7 first, then PPM — the originals cannot extract such files at all.
-- No packer emits flags 01/05/06/09 (decode-only dispatch cases); BSA16 additionally emits 2/3 (auto-selected: orig ≥ `0x5000` → 3, else 2).
+- No original packer emits flags 01/05/06/09; BSA16 additionally emits 2/3 (auto-selected: orig ≥ `0x5000` → 3, else 2). `bsn_pack` emits 05/06 in extension-free form (127/63-byte match caps, so symbols 0x17D/0x13D never occur and the streams equal methods 2/3 apart from the method byte): BSA200 (both Rels) and BSA193/195 accept them (`t` + byte-equal `x`), while BSA160 (predates 5/6) and bsa32/BSA2-230 (0/7/9 only) reject them as unknown. Emitted extensions (matches ≥128/64 bytes) are mishandled by the original decoders — BSA200 CRC-fails extended matches with distance > 1, BSA193/195 fail on symbol 509 — so they are not written; only this decoder handles them.
 - Old archives terminate with a single `00` at EOF instead of `00 00`.
 - BSA2-230's packed streams are byte-identical to bsa32 2.3 output; only its global-flags byte differs (`0x80` vs `0x01`).
 - BSA200 Rel 0.972's BSA packer is broken under emulation (headers never written; the archive starts with zero bytes); its BSN packer works (method 7 and, with `-++`, PPM — the latter is the `samplep.bsn` variant above). BSA16's and BSA2-230's work. BSA200's `-+0..4` only retune method-7 effort; `-++` selects PPM (still flagged 7 in BSA).
